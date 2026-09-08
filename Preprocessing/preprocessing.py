@@ -100,13 +100,13 @@ class states_preprocessor:
             config_list.append(config)
         return config_list
 
-    def get_data(config_list, stay_id_list, conn, initial_values): # main pipe line
+    def get_data(self,config_list, stay_id_list, conn, initial_values): # main pipeline
         extracted_data = {}
         
         for config in tqdm(config_list):
-            raw_df = query(config, stay_id_list, conn)
-            filtered_df = remove_outliers(config, raw_df)
-            resampled_df = resampling(config, filtered_df)
+            raw_df = self.query(config, stay_id_list, conn)
+            filtered_df = self.remove_outliers(config, raw_df)
+            resampled_df = self.resampling(config, filtered_df)
             extracted_data[config['item_name']] = resampled_df
 
         final_df = None
@@ -128,12 +128,10 @@ class states_preprocessor:
             final_df['heart_rate'] = final_df['BPM_noninv']
 
         if 'Temperature' in final_df.columns and 'heart_rate' in final_df.columns and 'RR' in final_df.columns and 'WBC' in final_df.columns:
-            final_df['SIRS'] = final_df.apply(calculate_sirs, axis=1)
+            final_df['SIRS'] = final_df.apply(self.calculate_sirs, axis=1)
         
         if 'heart_rate' in final_df.columns and 'NIBPs' in final_df.columns:
-            final_df['shock_index'] = final_df.apply(shock_index, axis=1)
-            
-        final_df['vasopressor_eq'] = final_df.apply(cal_vasopressor, axis=1)
+            final_df['shock_index'] = final_df.apply(self.shock_index, axis=1)
 
         for config in tqdm(config_list):
             item = config['item_name']
@@ -155,14 +153,14 @@ class states_preprocessor:
             elif method == 'interpolate':
                 final_df[item] = final_df.groupby('stay_id')[item].transform(lambda x: x.interpolate().ffill().bfill())
                 
-        for computed_col in ['SIRS', 'shock_index', 'vasopressor_eq']:
+        for computed_col in ['SIRS', 'shock_index']:
             if computed_col in final_df.columns:
                 final_df[computed_col] = final_df.groupby('stay_id')[computed_col].ffill().fillna(0)
 
         return final_df
 
     # calculation functions
-    def calculate_sirs(row): # SIRS 계산
+    def calculate_sirs(row): # SIRS calculation
         count = 0
         if pd.notna(row.get('Temperature')) and (row['Temperature'] > 38 or row['Temperature'] < 36):
             count += 1
@@ -174,26 +172,26 @@ class states_preprocessor:
         count += 1  
         return count if count >= 2 else 0
 
-    def shock_index(row): # shock index 계산
+    def shock_index(row): # shock index calculation
         hr = row.get('heart_rate')
         sbp = row.get('NIBPs')
         if pd.isna(hr) or pd.isna(sbp) or sbp == 0:
             return np.nan
         return hr / sbp
 
-    def merge_bpm(df_inv, df_noninv): # bpm 전처리
+    def merge_bpm(df_inv, df_noninv): # bpm preprocessing
         merged = pd.merge(df_inv, df_noninv, on=['stay_id', 'charttime'], how='outer')
         merged['BPM'] = merged['BPM_inv'].fillna(merged['BPM_noninv'])
         merged = merged.drop(columns=['BPM_inv', 'BPM_noninv'])
         return merged
 
-    def fill_zero(df, zero_fill_cols): # 0 보간
+    def fill_zero(df, zero_fill_cols): # 0 interpolation
         for col in zero_fill_cols:
             if col in df.columns:
                 df[col] = df[col].fillna(0)
         return df
 
-    def get_ages(): # stay_id별로 나이 계산
+    def get_ages(first_stay_id_str,cur): # age calculations per stay_id
         sql_age=f"""
             With group_age as
             (select i.stay_id,
@@ -236,7 +234,7 @@ class action_preprocessor:
         action_df = pd.read_sql(query, con=self.conn)
         
         if action_df.empty:
-            print("조회된 데이터가 없습니다.")
+            print("Data is empty")
             return pd.DataFrame()
 
         action_df['time_hour'] = pd.to_datetime(action_df['time_hour'], errors='coerce')
@@ -325,7 +323,7 @@ class action_preprocessor:
         vaso = row.get('vasopressin', 0)
         return norepi + (1/150)*dopa + 0.1*epi + 0.1*phenyl + (2.5*vaso)/60
 
-    def main(self):
+    def main(self): # fetch actions
         final_action_dataframe = self.get_action_data()
         return final_action_dataframe
 
