@@ -10,7 +10,7 @@ class target_cohort:
         self.cur=cur
     def query(self):
         q=f"""
-        {self.whereclause}
+        {self.withclause}
         Select subject_id, stay_id, intime {self.fromwhereclause};
         """
         self.cur.execute(q)
@@ -18,21 +18,20 @@ class target_cohort:
         first_stay_id=[]
         for i in q_stay_id_result:
             first_stay_id.append(i['stay_id'])
-        first_stay_id_str=", ".join(map(str, first_stay_id))
-        return first_stay_id_str
+        return first_stay_id
 
 # States Data Preprocessing
 class states_preprocessor:
-    def __init__(self,conn,cur,INTERVAL,my_required_items,first_stay_id,initial_values,zero_fill_cols):
-        self.conn=conn
-        self.cur=cur
-        self.INTERVAL=INTERVAL
-        self.initial_values=initial_values
-        self.first_stay_id=first_stay_id
-        self.my_required_items=my_required_items
-        self.zero_fill_cols=zero_fill_cols
+    def __init__(self, conn, cur, INTERVAL, my_required_items, first_stay_id, initial_values, zero_fill_cols):
+        self.conn = conn
+        self.cur = cur
+        self.INTERVAL = INTERVAL
+        self.initial_values = initial_values
+        self.first_stay_id = first_stay_id
+        self.my_required_items = my_required_items
+        self.zero_fill_cols = zero_fill_cols
 
-    def query(config, stay_id_list, conn): # fetch queries
+    def query(self, config, stay_id_list, conn): 
         stay_str = ','.join(map(str, stay_id_list))
         sql = f"""
             WITH item_filtered AS (
@@ -49,7 +48,7 @@ class states_preprocessor:
         """
         return pd.read_sql(sql, conn)
     
-    def remove_outliers(config, data): # removing ~1,99~ quantile as an outliers
+    def remove_outliers(self, config, data):
         item = config['item_name']
         if not data.empty and item in data.columns:
             q_low = data.groupby('stay_id')[item].transform(lambda x: x.quantile(0.01))
@@ -57,7 +56,7 @@ class states_preprocessor:
             data = data[(data[item] >= q_low) & (data[item] <= q_hi)]
         return data
     
-    def resampling(config, data): # resampling datas w.r.t given resampling hour
+    def resampling(self, config, data): 
         data['charttime'] = pd.to_datetime(data['charttime'])
         resampled = (data.groupby('stay_id')
                     .apply(lambda x: x.set_index('charttime')
@@ -66,23 +65,29 @@ class states_preprocessor:
                     .reset_index())
         return resampled
     
-    def preprocessing(config, data, initial_values): # preprocessing
+    def preprocessing(self, config, data, initial_values): 
         item = config['item_name']
         method = config['fill_method']
-        if initial_values and item in initial_values and not data.empty:
+        
+        if data.empty or item not in data.columns:
+            return data
+
+        data[item] = pd.to_numeric(data[item], errors='coerce')
+        
+        if initial_values and item in initial_values:
             first_indices = data.groupby('stay_id').head(1).index
             data.loc[first_indices, item] = data.loc[first_indices, item].fillna(initial_values[item])
 
         if method == 'ffill':
-            data[item] = data.groupby('stay_id')[item].ffill()
+            data[item] = data.groupby('stay_id')[item].ffill().bfill()
         elif method == 'bfill':
-            data[item] = data.groupby('stay_id')[item].bfill()
+            data[item] = data.groupby('stay_id')[item].bfill().ffill()
         elif method == 'interpolate':
-            data[item] = data.groupby('stay_id')[item].transform(lambda x: x.interpolate())
+            data[item] = data.groupby('stay_id')[item].transform(lambda x: x.interpolate().ffill().bfill())
             
         return data
     
-    def create_pipeline_config(required_items,global_resample_hour=1): # creating preprocessing guidelines
+    def create_pipeline_config(self, required_items, global_resample_hour=1): 
         config_list = []
         for item in required_items:
             config = {
@@ -100,14 +105,15 @@ class states_preprocessor:
             config_list.append(config)
         return config_list
 
-    def get_data(self,config_list, stay_id_list, conn, initial_values): # main pipeline
+    def get_data(self, config_list, stay_id_list, conn, initial_values):
         extracted_data = {}
-        
-        for config in tqdm(config_list):
+
+        for config in tqdm(config_list, desc="Extracting & Preprocessing Features"):
             raw_df = self.query(config, stay_id_list, conn)
             filtered_df = self.remove_outliers(config, raw_df)
             resampled_df = self.resampling(config, filtered_df)
-            extracted_data[config['item_name']] = resampled_df
+            preprocessed_df = self.preprocessing(config, resampled_df, initial_values) 
+            extracted_data[config['item_name']] = preprocessed_df
 
         final_df = None
         for name, df in extracted_data.items():
@@ -118,49 +124,34 @@ class states_preprocessor:
 
         if final_df is not None:
             final_df = final_df.sort_values(['stay_id', 'charttime']).reset_index(drop=True)
+        else:
+            return pd.DataFrame()
+
 
         if 'BPM_inv' in final_df.columns and 'BPM_noninv' in final_df.columns:
             final_df['heart_rate'] = final_df['BPM_inv'].fillna(final_df['BPM_noninv'])
             final_df = final_df.drop(columns=['BPM_inv', 'BPM_noninv'])
         elif 'BPM_inv' in final_df.columns:
             final_df['heart_rate'] = final_df['BPM_inv']
+            final_df = final_df.drop(columns=['BPM_inv'])
         elif 'BPM_noninv' in final_df.columns:
             final_df['heart_rate'] = final_df['BPM_noninv']
+            final_df = final_df.drop(columns=['BPM_noninv'])
 
-        if 'Temperature' in final_df.columns and 'heart_rate' in final_df.columns and 'RR' in final_df.columns and 'WBC' in final_df.columns:
+        final_df['SIRS'] = 0
+        final_df['shock_index'] = 0.0
+
+        sirs_cols = ['Temperature', 'heart_rate', 'RR', 'WBC']
+        if all(col in final_df.columns for col in sirs_cols):
             final_df['SIRS'] = final_df.apply(self.calculate_sirs, axis=1)
-        
-        if 'heart_rate' in final_df.columns and 'NIBPs' in final_df.columns:
+            
+        shock_cols = ['heart_rate', 'NIBPs']
+        if all(col in final_df.columns for col in shock_cols):
             final_df['shock_index'] = final_df.apply(self.shock_index, axis=1)
-
-        for config in tqdm(config_list):
-            item = config['item_name']
-            if item in ['BPM_inv', 'BPM_noninv']:
-                item = 'heart_rate'
-                
-            if item not in final_df.columns:
-                continue
-            final_df[item] = pd.to_numeric(final_df[item], errors='coerce')
-            if initial_values and item in initial_values:
-                first_indices = final_df.groupby('stay_id').head(1).index
-                final_df.loc[first_indices, item] = final_df.loc[first_indices, item].fillna(initial_values[item])
-                
-            method = config['fill_method']
-            if method == 'ffill':
-                final_df[item] = final_df.groupby('stay_id')[item].ffill()
-            elif method == 'bfill':
-                final_df[item] = final_df.groupby('stay_id')[item].bfill()
-            elif method == 'interpolate':
-                final_df[item] = final_df.groupby('stay_id')[item].transform(lambda x: x.interpolate().ffill().bfill())
-                
-        for computed_col in ['SIRS', 'shock_index']:
-            if computed_col in final_df.columns:
-                final_df[computed_col] = final_df.groupby('stay_id')[computed_col].ffill().fillna(0)
 
         return final_df
 
-    # calculation functions
-    def calculate_sirs(row): # SIRS calculation
+    def calculate_sirs(self, row): 
         count = 0
         if pd.notna(row.get('Temperature')) and (row['Temperature'] > 38 or row['Temperature'] < 36):
             count += 1
@@ -169,50 +160,45 @@ class states_preprocessor:
         if pd.notna(row.get('RR')) and row['RR'] > 20:
             count += 1
         if pd.notna(row.get('WBC')) and (row['WBC'] > 12000 or row['WBC'] < 4000):
-        count += 1  
+            count += 1  
         return count if count >= 2 else 0
 
-    def shock_index(row): # shock index calculation
+    def shock_index(self, row):
         hr = row.get('heart_rate')
         sbp = row.get('NIBPs')
         if pd.isna(hr) or pd.isna(sbp) or sbp == 0:
             return np.nan
         return hr / sbp
 
-    def merge_bpm(df_inv, df_noninv): # bpm preprocessing
-        merged = pd.merge(df_inv, df_noninv, on=['stay_id', 'charttime'], how='outer')
-        merged['BPM'] = merged['BPM_inv'].fillna(merged['BPM_noninv'])
-        merged = merged.drop(columns=['BPM_inv', 'BPM_noninv'])
-        return merged
-
-    def fill_zero(df, zero_fill_cols): # 0 interpolation
+    def fill_zero(self, df, zero_fill_cols):
         for col in zero_fill_cols:
             if col in df.columns:
                 df[col] = df[col].fillna(0)
         return df
-
-    def get_ages(first_stay_id_str,cur): # age calculations per stay_id
-        sql_age=f"""
-            With group_age as
-            (select i.stay_id,
-            (p.anchor_age + (EXTRACT(YEAR FROM a.admittime) - p.anchor_year)) AS age 
-            FROM mimic.icustays i
-            LEFT JOIN mimic_hosp.admissions a ON i.hadm_id = a.hadm_id
-            LEFT JOIN mimic.patients p ON i.subject_id = p.subject_id)
-            select group_age.stay_id,group_age.age
-            from group_age where 
-            group_age.stay_id in ({first_stay_id_str})
-            order by group_age.age desc;"""
-        cur.execute(sql_age)
-        age_result=cur.fetchall()
-        df_age=pd.DataFrame(age_result)
-        return df_age
-
+    
+    def get_ages(self,first_stay_id_str,cur): # age calculations per stay_id
+            sql_age=f"""
+                With group_age as
+                (select i.stay_id,
+                (p.anchor_age + (EXTRACT(YEAR FROM a.admittime) - p.anchor_year)) AS age 
+                FROM mimic.icustays i
+                LEFT JOIN mimic_hosp.admissions a ON i.hadm_id = a.hadm_id
+                LEFT JOIN mimic.patients p ON i.subject_id = p.subject_id)
+                select group_age.stay_id,group_age.age
+                from group_age where 
+                group_age.stay_id in ({first_stay_id_str})
+                order by group_age.age desc;"""
+            cur.execute(sql_age)
+            age_result=cur.fetchall()
+            df_age=pd.DataFrame(age_result)
+            return df_age
+    
     def main(self):
-        config_list = self.create_pipeline_config(self.my_required_items,global_resample_hour=self.INTERVAL)
+        config_list = self.create_pipeline_config(self.my_required_items, global_resample_hour=self.INTERVAL)
         final_dataframe = self.get_data(config_list, self.first_stay_id, self.conn, self.initial_values)
         final_dataframe = self.fill_zero(final_dataframe, self.zero_fill_cols)
         return final_dataframe
+
 
 # Action Data Preprocessing
 class action_preprocessor:
@@ -301,21 +287,21 @@ class action_preprocessor:
             return pd.DataFrame()
 
     #calculation functions 
-    def discretize_iv_fluid(val):# discretizing IV into 5 discrete actions
+    def discretize_iv_fluid(self,val):# discretizing IV into 5 discrete actions
         if val == 0: return 1
         elif 0 < val <= 50: return 2
         elif 50 < val <= 180: return 3
         elif 180 < val <= 530: return 4
         else: return 5
 
-    def discretize_vasopressor(val): # discretizing Vaso into 5 discrete actions
+    def discretize_vasopressor(self,val): # discretizing Vaso into 5 discrete actions
         if val == 0: return 1
         elif 0 < val <= 0.08: return 2
         elif 0.08 < val <= 0.22: return 3
         elif 0.22 < val <= 0.45: return 4
         else: return 5
 
-    def cal_vasopressor_action(row): # vaso transformation
+    def cal_vasopressor_action(self,row): # vaso transformation
         norepi = row.get('norepinephrine', 0)
         dopa = row.get('dopamine', 0)
         epi = row.get('epinephrine', 0)
@@ -328,3 +314,14 @@ class action_preprocessor:
         return final_action_dataframe
 
 
+class sofa:
+    def __init__(self,conn,cur,stay_ids):
+        self.conn=conn
+        self.cur=cur
+        self.stay_ids=stay_ids
+    def main(self):
+        stay_str = ','.join(map(str, self.stay_ids))
+        q=f"""
+        select stay_id, chart_hour,total_sofa_score from hrl.sofa_score_test where stay_id in ({stay_str})
+        """
+        return pd.read_sql(q, self.conn)

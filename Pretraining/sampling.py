@@ -4,9 +4,10 @@ import numpy as np
 from scipy.stats import wasserstein_distance
 from tqdm import tqdm
 class Sample:
-    def __init__(self, data, iterations=1000, threshold=0.01, sample_size=1000):
+    def __init__(self, data, iterations=1000, threshold=0.01, sample_size=1000,sofa=0):
         # data: DataFrame with columns ['stay_id', 'sofa_score']
         self.data = data
+        self.df=sofa
         self.iterations = iterations
         self.threshold = threshold
         self.sample_size = sample_size
@@ -20,7 +21,7 @@ class Sample:
         self.best_sample_ids = []
         self.best_distance = float('inf')
 
-    def get_sofa_stats(self, df):
+    def get_sofa_stats(self,df):
         # max, min, range
         stats = df.groupby('stay_id')['sofa_score'].agg(['max', 'min'])
         stats['range'] = stats['max'] - stats['min']
@@ -31,8 +32,8 @@ class Sample:
 
     def get_sample(self):
         # population statistics
-        self.pop_max, self.pop_min, self.pop_range = self.get_sofa_stats(self.data)
-        unique_stay_ids = self.data['stay_id'].unique()
+        self.pop_max, self.pop_min, self.pop_range = self.get_sofa_stats(self.df)
+        unique_stay_ids = self.df['stay_id'].unique()
         
         if len(unique_stay_ids) < self.sample_size:
             raise ValueError("sample size is too large")
@@ -42,7 +43,7 @@ class Sample:
         for i in tqdm(range(self.iterations)):
             #Sampling
             sampled_ids = np.random.choice(unique_stay_ids, size=self.sample_size, replace=True)
-            sample_df = self.data[self.data['stay_id'].isin(sampled_ids)]
+            sample_df = self.df[self.df['stay_id'].isin(sampled_ids)]
             
             # sample stats
             samp_max, samp_min, samp_range = self.get_sofa_stats(sample_df)
@@ -58,7 +59,7 @@ class Sample:
             if total_distance < self.best_distance:
                 self.best_distance = total_distance
                 self.best_sample_ids = sampled_ids
-                print(f"Iteration {i+1}: New best with {total_distance:.4f})")
+                print(f"Iteration {i+1}: New best with {total_distance:.4f}), max: {dist_max:.4f}, min:{dist_min:.4f},range:{dist_range:.4f}")
                 if total_distance <= self.threshold: # best is over threshold then stop
                     print(f"({self.threshold}) is met. Early finish.")
                     break
